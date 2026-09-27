@@ -1,0 +1,9 @@
+[project]
+name = "offline-dns-resolver"
+version = "1.0.0"
+description = "Offline DNS zone answering API (A and reverse PTR queries, CNAME chains, wildcards, NS delegation)"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

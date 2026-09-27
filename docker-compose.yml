@@ -1,0 +1,13 @@
+services:
+  dns-resolver:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DNS_DB_PATH=/data/zones.db
+    volumes:
+      - dns-data:/data
+    restart: unless-stopped
+
+volumes:
+  dns-data:
