@@ -1,6 +1,6 @@
 # 离线 DNS 区域应答 API
 
-基于 FastAPI 的离线 DNS 区域解析服务：在请求体中携带整个区域数据，对查询域名执行 **A 查询** 解析，或对 IPv4 地址执行 **PTR 反向查询**（`in-addr.arpa.`），支持 CNAME 链、通配符与 **NS 区域委派**。同时提供 **区域快照与条件更新** 模块：区域数据持久化在 SQLite 中，可按版本与前置条件进行原子更新，并对每个已提交版本留档，支持任意两个版本间的 **差异导出**；也可以把 **DNS 主文件（zone file）文本** 直接导入为版本 0 快照。
+基于 FastAPI 的离线 DNS 区域解析服务：在请求体中携带整个区域数据，对查询域名执行 **A 查询** 解析，或对 IPv4 地址执行 **PTR 反向查询**（`in-addr.arpa.`），支持 CNAME 链、通配符与 **NS 区域委派**。同时提供 **区域快照与条件更新** 模块：区域数据持久化在 SQLite 中，可按版本与前置条件进行原子更新，并对每个已提交版本留档，支持任意两个版本间的 **差异导出** 与 **探针影响面分析**（比较同一批查询在两个版本下的应答差异）；也可以把 **DNS 主文件（zone file）文本** 直接导入为版本 0 快照。
 
 ## 启动
 
@@ -289,6 +289,70 @@ curl -s "http://localhost:8000/zones/$ZID/diff?from_version=0&to_version=1"
 - 历史随 SQLite 持久化，服务重启后仍可查询。
 - 未知区域 id 或任一版本未留档返回 `404`；参数非法（负数、非整数、缺参、`from_version > to_version`）返回 `422`。
 
+### `POST /zones/{id}/impact`
+
+对一组**探针查询**比较两个留档版本的应答（影响面分析）。每个探针分别在 `from_version` 与 `to_version` 的留档快照上，按与 `POST /resolve`、`POST /reverse` 完全相同的规则求值。请求体：
+
+```json
+{
+  "from_version": 0,
+  "to_version": 1,
+  "probes": [
+    {"type": "A", "name": "www.example.com"},
+    {"type": "PTR", "address": "192.168.1.10"}
+  ]
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `from_version` / `to_version` | 两个已留档版本号，非负整数；**可相同、可逆序**（不要求 `from_version ≤ to_version`） |
+| `probes` | 探针列表。`{"type": "A", "name": "<域名>"}` 按 A 查询求值；`{"type": "PTR", "address": "<IPv4>"}` 先拼成反查域名再按 PTR 查询求值；`type` 大小写不限 |
+
+响应 `200`：
+
+```json
+{
+  "id": "...",
+  "zone": "example.com.",
+  "from_version": 0,
+  "to_version": 1,
+  "results": [
+    {
+      "type": "A",
+      "query": "www.example.com.",
+      "address": null,
+      "before": {
+        "status": "NOERROR",
+        "chain": ["www.example.com."],
+        "addresses": ["192.0.2.1"],
+        "delegation": null,
+        "nameservers": [],
+        "glue": [],
+        "error": null
+      },
+      "after": {
+        "status": "NOERROR",
+        "chain": ["www.example.com."],
+        "addresses": ["192.0.2.2"],
+        "delegation": null,
+        "nameservers": [],
+        "glue": [],
+        "error": null
+      },
+      "changed": true
+    }
+  ]
+}
+```
+
+- `results` 与输入探针一一对应，**保持输入顺序与重复项**；每项含规范化查询名 `query`（PTR 探针为反查域名，另带规范化 `address`）、`before`（`from_version` 处结果）、`after`（`to_version` 处结果）与 `changed`。
+- `before` / `after` 的字段与 `POST /resolve`、`POST /reverse` 的应答一致：A 探针含 `addresses`，PTR 探针含 `hostnames`，其余为 `status`、`chain`、`delegation`、`nameservers`、`glue`、`error`。
+- `changed` **仅由** `status`、`chain`、`addresses`/`hostnames`、`delegation`、`nameservers`、`glue` 的差异决定（`error` 不参与比较）。因为整个解析过程在两个版本上完整重算，**即使探针名上的记录本身未改**，CNAME 目标、通配符、空节点或委派（含 glue）变化带来的间接应答差异也会反映为 `changed: true`。
+- 探针格式非法（未知类型、缺少 `name`/`address`、域名或 IPv4 非法）返回 `422`；含 PTR 探针而区域不是合法反向区域（`in-addr.arpa.` 或至多四段八位组子域）返回 `422`。**任一探针非法则整批失败，不返回部分结果**。
+- 未知区域 id 或任一版本未留档返回 `404`；版本号为负、非整数或缺失返回 `422`。
+- 接口**只读**：不修改快照、当前版本与历史留档。
+
 ## 示例
 
 普通 A / CNAME 查询：
@@ -372,6 +436,29 @@ curl -s "http://localhost:8000/zones/$ZID/diff?from_version=0&to_version=1"
 # => {"zone":"example.com.","from_version":0,"to_version":1,
 #     "removed":[{"name":"www.example.com.","type":"A","value":"192.0.2.1"}],
 #     "added":[{"name":"www.example.com.","type":"A","value":"192.0.2.2"}]}
+
+# 影响面分析：比较两个版本对同一批探针查询的应答（服务端口同为 8000）
+curl -s http://localhost:8000/zones/$ZID/impact \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "from_version": 0,
+        "to_version": 1,
+        "probes": [
+          {"type": "A", "name": "www.example.com"},
+          {"type": "A", "name": "www.example.com"}
+        ]
+      }'
+# => {"id":"...","zone":"example.com.","from_version":0,"to_version":1,
+#     "results":[
+#       {"type":"A","query":"www.example.com.","address":null,
+#        "before":{"status":"NOERROR","chain":["www.example.com."],
+#                  "addresses":["192.0.2.1"],"delegation":null,
+#                  "nameservers":[],"glue":[],"error":null},
+#        "after":{"status":"NOERROR","chain":["www.example.com."],
+#                 "addresses":["192.0.2.2"],"delegation":null,
+#                 "nameservers":[],"glue":[],"error":null},
+#        "changed":true},
+#       ... 重复的探针按输入顺序原样返回 ...]}
 ```
 
 从主文件文本导入区域（同样得到版本 0 快照，记下返回的 id 即可接上面的读取/更新/差异命令）：

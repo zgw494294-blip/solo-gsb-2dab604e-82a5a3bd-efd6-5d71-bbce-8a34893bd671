@@ -333,6 +333,190 @@ def diff_zone(
     )
 
 
+# ---------------------------------------------------------------------------
+# Impact analysis: probe evaluation across two archived versions
+# ---------------------------------------------------------------------------
+
+
+class ProbeIn(BaseModel):
+    type: str = Field(..., description="A (forward query) or PTR (reverse query)")
+    name: str | None = Field(
+        default=None,
+        examples=["www.example.com"],
+        description="A probes: the query name",
+    )
+    address: str | None = Field(
+        default=None,
+        examples=["192.0.2.1"],
+        description="PTR probes: the IPv4 address to reverse-map",
+    )
+
+
+class ImpactRequest(BaseModel):
+    from_version: int = Field(..., ge=0)
+    to_version: int = Field(..., ge=0)
+    probes: list[ProbeIn] = Field(default_factory=list)
+
+
+class ForwardImpact(BaseModel):
+    status: str
+    chain: list[str]
+    addresses: list[str] = Field(default_factory=list)
+    delegation: str | None = None
+    nameservers: list[str] = Field(default_factory=list)
+    glue: list[GlueRecord] = Field(default_factory=list)
+    error: str | None = None
+
+
+class ReverseImpact(BaseModel):
+    status: str
+    chain: list[str]
+    hostnames: list[str] = Field(default_factory=list)
+    delegation: str | None = None
+    nameservers: list[str] = Field(default_factory=list)
+    glue: list[GlueRecord] = Field(default_factory=list)
+    error: str | None = None
+
+
+class ImpactItem(BaseModel):
+    type: str
+    query: str = Field(..., description="Normalized query name")
+    address: str | None = Field(
+        default=None, description="PTR probes only: canonical IPv4 address"
+    )
+    before: ForwardImpact | ReverseImpact = Field(
+        ..., description="Outcome evaluated at from_version"
+    )
+    after: ForwardImpact | ReverseImpact = Field(
+        ..., description="Outcome evaluated at to_version"
+    )
+    changed: bool = Field(
+        ...,
+        description="True when status, chain, addresses/hostnames, delegation, "
+        "nameservers or glue differ between the two versions",
+    )
+
+
+class ZoneImpact(BaseModel):
+    id: str
+    zone: str
+    from_version: int
+    to_version: int
+    results: list[ImpactItem] = Field(
+        default_factory=list,
+        description="One entry per probe, in input order, duplicates kept",
+    )
+
+
+def _normalize_probe(probe: ProbeIn) -> tuple[str, str, "str | None"]:
+    """Validate one probe; return (type, normalized query name, address)."""
+    ptype = probe.type.strip().upper()
+    if ptype == "A":
+        if probe.name is None:
+            raise ZoneError("A probe requires a 'name'")
+        return "A", normalize_name(probe.name), None
+    if ptype == "PTR":
+        if probe.address is None:
+            raise ZoneError("PTR probe requires an 'address'")
+        address, qname = reverse_query_name(probe.address)
+        return "PTR", qname, address
+    raise ZoneError(f"unsupported probe type {probe.type!r}; only A and PTR")
+
+
+def _impact_key(result: Resolution) -> tuple:
+    """The fields that decide whether two outcomes differ (error excluded)."""
+    return (
+        result.status,
+        tuple(result.chain),
+        tuple(result.addresses),
+        tuple(result.hostnames),
+        result.delegation,
+        tuple(result.nameservers),
+        tuple((g["name"], g["type"], tuple(g["addresses"])) for g in result.glue),
+    )
+
+
+def _forward_impact(result: Resolution) -> ForwardImpact:
+    return ForwardImpact(
+        status=result.status,
+        chain=result.chain,
+        addresses=result.addresses,
+        delegation=result.delegation,
+        nameservers=result.nameservers,
+        glue=[GlueRecord(**g) for g in result.glue],
+        error=result.error,
+    )
+
+
+def _reverse_impact(result: Resolution) -> ReverseImpact:
+    return ReverseImpact(
+        status=result.status,
+        chain=result.chain,
+        hostnames=result.hostnames,
+        delegation=result.delegation,
+        nameservers=result.nameservers,
+        glue=[GlueRecord(**g) for g in result.glue],
+        error=result.error,
+    )
+
+
+@app.post("/zones/{zone_id}/impact", response_model=ZoneImpact)
+def impact_zone(zone_id: str, req: ImpactRequest) -> ZoneImpact:
+    # Validate the whole batch first: a single bad probe fails the request.
+    try:
+        probes = [_normalize_probe(p) for p in req.probes]
+    except ZoneError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    store = zone_store.get_store()
+    try:
+        before_snap = store.snapshot_at(zone_id, req.from_version)
+        after_snap = store.snapshot_at(zone_id, req.to_version)
+    except zone_store.ZoneNotFound as exc:
+        raise HTTPException(
+            status_code=404, detail=f"unknown zone id {zone_id!r}"
+        ) from exc
+    except zone_store.VersionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if any(ptype == "PTR" for ptype, _, _ in probes):
+        try:
+            check_reverse_zone(before_snap.zone)
+        except ZoneError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    before_zone = build_zone(before_snap.zone, before_snap.records)
+    after_zone = build_zone(after_snap.zone, after_snap.records)
+    results = []
+    for ptype, qname, address in probes:
+        if ptype == "A":
+            before = resolve(before_zone, qname, "A")
+            after = resolve(after_zone, qname, "A")
+            item = ImpactItem(
+                type="A",
+                query=qname,
+                before=_forward_impact(before),
+                after=_forward_impact(after),
+                changed=_impact_key(before) != _impact_key(after),
+            )
+        else:
+            before = resolve_ptr(before_zone, qname)
+            after = resolve_ptr(after_zone, qname)
+            item = ImpactItem(
+                type="PTR",
+                query=qname,
+                address=address,
+                before=_reverse_impact(before),
+                after=_reverse_impact(after),
+                changed=_impact_key(before) != _impact_key(after),
+            )
+        results.append(item)
+    return ZoneImpact(
+        id=zone_id,
+        zone=before_snap.zone,
+        from_version=req.from_version,
+        to_version=req.to_version,
+        results=results,
+    )
+
+
 @app.post("/zones/{zone_id}/updates", response_model=ZoneSnapshot)
 def update_zone(zone_id: str, req: ZoneUpdateRequest) -> ZoneSnapshot:
     try:

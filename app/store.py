@@ -187,6 +187,37 @@ class ZoneStore:
             ]
         return Snapshot(zone_id, row["zone"], row["version"], rows)
 
+    def snapshot_at(self, zone_id: str, version: int) -> Snapshot:
+        """Return the archived snapshot for one version of a zone.
+
+        Read-only: raises ZoneNotFound for an unknown zone id and
+        VersionNotFound when the requested version was never archived.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT zone FROM zones WHERE id = ?", (zone_id,)
+            ).fetchone()
+            if row is None:
+                raise ZoneNotFound(zone_id)
+            archived = self._conn.execute(
+                "SELECT 1 FROM zone_versions WHERE zone_id = ? AND version = ?",
+                (zone_id, version),
+            ).fetchone()
+            if archived is None:
+                raise VersionNotFound(
+                    f"zone {zone_id!r} has no archived version {version}"
+                )
+            rows = [
+                (r["name"], r["type"], r["value"])
+                for r in self._conn.execute(
+                    "SELECT name, type, value FROM zone_version_records"
+                    " WHERE zone_id = ? AND version = ?"
+                    " ORDER BY name, type, value",
+                    (zone_id, version),
+                )
+            ]
+        return Snapshot(zone_id, row["zone"], version, rows)
+
     def apply_update(
         self,
         zone_id: str,
